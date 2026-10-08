@@ -11,7 +11,10 @@ data class Video(
     val thumbnails: List<Thumbnail>,
     val streams: List<Stream> = emptyList(),
     val userAgent: String = "",   // stream URL isi User-Agent se chalta hai (player mein lagao)
-    val client: String = ""       // kaunse client se mila
+    val client: String = "",      // kaunse client se mila
+    val hlsUrl: String = "",      // HLS manifest (adaptive, 1080p tak) - bina PO token ke chal sakta hai
+    val hlsUserAgent: String = "", // HLS ke liye User-Agent
+    val hlsMaxHeight: Int = 0      // HLS manifest mein sabse badi quality (1080 etc), 0 = pata nahi
 )
 
 data class Thumbnail(
@@ -40,5 +43,13 @@ data class VideoItem(
     val duration: String,     // "3:33" (live ho to khali)
     val views: String,        // "1.8B views"
     val published: String,    // "2 years ago"
-    val thumbnailUrl: String
+    val thumbnailUrl: String,
+    val channelId: String = "",
+    val channelThumbnail: String = ""   // channel ka logo
+)
+
+// Ek page: items + agla page lene ka token (null = aur nahi hai)
+data class SearchPage(
+    val items: List<VideoItem>,
+    val nextToken: String?
 )
