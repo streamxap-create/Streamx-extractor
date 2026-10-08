@@ -73,4 +73,27 @@ class Downloader {
             null
         }
     }
+
+    // Player jaisa asli test: Range maang kar kuch bytes padhta hai. 200/206 = theek, 403 = block, -1 = network fail, -2 = khali jawab
+    fun probeRange(
+        url: String,
+        headers: Map<String, String>,
+        start: Long,
+        endInclusive: Long,
+        readBytes: Int = 4096
+    ): Int {
+        val builder = Request.Builder().url(url).get().header("Range", "bytes=$start-$endInclusive")
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        return try {
+            client.newCall(builder.build()).execute().use { r ->
+                if (r.code == 200 || r.code == 206) {
+                    val buf = ByteArray(readBytes)
+                    val n = r.body?.byteStream()?.read(buf) ?: -1
+                    if (n <= 0) -2 else r.code
+                } else r.code
+            }
+        } catch (e: Exception) {
+            -1
+        }
+    }
 }
