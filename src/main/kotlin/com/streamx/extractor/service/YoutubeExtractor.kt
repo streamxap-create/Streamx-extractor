@@ -6,6 +6,7 @@ import com.streamx.extractor.client.Downloader
 import com.streamx.extractor.model.ClientReport
 import com.streamx.extractor.model.Stream
 import com.streamx.extractor.model.Thumbnail
+import com.streamx.extractor.model.SearchPage
 import com.streamx.extractor.model.Video
 import com.streamx.extractor.model.VideoItem
 
@@ -124,7 +125,9 @@ class YoutubeExtractor(
                 thumbnails = parseThumbnails(details),
                 streams = parseStreams(root["streamingData"] as? Map<*, *>),
                 userAgent = c.userAgent,
-                client = c.name
+                client = c.name,
+                hlsUrl = (root["streamingData"] as? Map<*, *>)?.get("hlsManifestUrl") as? String ?: "",
+                hlsUserAgent = c.userAgent
             )
 
             val probeCode = if (probe && video.streams.isNotEmpty())
@@ -161,11 +164,30 @@ class YoutubeExtractor(
                 continue
             }
             val code = a.report.probeHttpCode
-            if (code == 200 || code == 206) return v      // URL sach mein chalta hai
+            if (code == 200 || code == 206) return withHls(v, videoId)   // URL sach mein chalta hai
             if (fallback == null) fallback = v
             errors.add("${c.name}: URL block (HTTP $code)")
         }
-        return fallback ?: throw Exception("Video load fail ($videoId) -> " + errors.joinToString(" | "))
+        return fallback?.let { withHls(it, videoId) }
+            ?: throw Exception("Video load fail ($videoId) -> " + errors.joinToString(" | "))
+    }
+
+    // HLS manifest (adaptive 1080p) IOS client se aata hai; ANDROID wale video mein jod do.
+    // Manifest sach mein khulta hai ya nahi check karta hai aur sabse badi quality nikalta hai.
+    private fun withHls(v: Video, videoId: String): Video {
+        if (v.hlsUrl.isNotEmpty()) return v
+        val ios = clients.firstOrNull { it.name == "IOS" } ?: return v
+        return try {
+            val url = attempt(ios, videoId, probe = false).video?.hlsUrl.orEmpty()
+            if (url.isEmpty()) return v
+            val text = downloader.getText(url, mapOf("User-Agent" to ios.userAgent))
+            if (text == null || !text.contains("#EXTM3U")) return v
+            val maxH = Regex("RESOLUTION=\\d+x(\\d+)").findAll(text)
+                .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull() ?: 0
+            v.copy(hlsUrl = url, hlsUserAgent = ios.userAgent, hlsMaxHeight = maxH)
+        } catch (e: Exception) {
+            v
+        }
     }
 
     fun diagnose(videoId: String): List<ClientReport> =
@@ -179,11 +201,13 @@ class YoutubeExtractor(
         "gl" to "IN"
     )
 
-    fun search(query: String): List<VideoItem> {
-        val body = mapOf(
-            "context" to mapOf("client" to webClientJson),
-            "query" to query
-        )
+    fun search(query: String): List<VideoItem> = searchPage(query, null).items
+
+    fun searchPage(query: String, continuation: String?): SearchPage {
+        val ctx = mapOf("client" to webClientJson)
+        val body: Map<String, Any> =
+            if (continuation == null) mapOf("context" to ctx, "query" to query)
+            else mapOf("context" to ctx, "continuation" to continuation)
         val payload = moshi.adapter(Map::class.java).toJson(body)
         val headers = mapOf(
             "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
@@ -201,19 +225,54 @@ class YoutubeExtractor(
         collectVideoRenderers(root, renderers)
 
         val seen = HashSet<String>()
-        return renderers.mapNotNull { r ->
+        val items = renderers.mapNotNull { r ->
             val id = r["videoId"] as? String ?: return@mapNotNull null
             if (!seen.add(id)) return@mapNotNull null
+            val owner = r["ownerText"] ?: r["longBylineText"]
             VideoItem(
                 id = id,
                 title = textOf(r["title"]),
-                channelName = textOf(r["ownerText"]).ifEmpty { textOf(r["longBylineText"]) },
+                channelName = textOf(owner),
                 duration = textOf(r["lengthText"]),
                 views = textOf(r["viewCountText"]).ifEmpty { textOf(r["shortViewCountText"]) },
                 published = textOf(r["publishedTimeText"]),
-                thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+                thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+                channelId = channelIdOf(owner),
+                channelThumbnail = avatarOf(r)
             )
         }
+        return SearchPage(items, findContinuationToken(root))
+    }
+
+    private fun channelIdOf(owner: Any?): String {
+        val run = ((owner as? Map<*, *>)?.get("runs") as? List<*>)?.firstOrNull() as? Map<*, *>
+        val nav = run?.get("navigationEndpoint") as? Map<*, *>
+        val browse = nav?.get("browseEndpoint") as? Map<*, *>
+        return browse?.get("browseId") as? String ?: ""
+    }
+
+    private fun avatarOf(r: Map<*, *>): String {
+        val a = (r["channelThumbnailSupportedRenderers"] as? Map<*, *>)
+            ?.get("channelThumbnailWithLinkRenderer") as? Map<*, *>
+        val thumbs = (a?.get("thumbnail") as? Map<*, *>)?.get("thumbnails") as? List<*>
+        val url = (thumbs?.firstOrNull() as? Map<*, *>)?.get("url") as? String ?: return ""
+        return if (url.startsWith("//")) "https:$url" else url
+    }
+
+    // Agla page ka token (infinite scroll ke liye)
+    private fun findContinuationToken(node: Any?): String? {
+        when (node) {
+            is Map<*, *> -> {
+                val cir = node["continuationItemRenderer"] as? Map<*, *>
+                if (cir != null) {
+                    val cmd = (cir["continuationEndpoint"] as? Map<*, *>)?.get("continuationCommand") as? Map<*, *>
+                    (cmd?.get("token") as? String)?.let { return it }
+                }
+                for (v in node.values) findContinuationToken(v)?.let { return it }
+            }
+            is List<*> -> for (x in node) findContinuationToken(x)?.let { return it }
+        }
+        return null
     }
 
     // JSON mein kahin bhi "videoRenderer" mile to utha lo (layout badle to bhi chalega)
