@@ -1,16 +1,15 @@
-# Streamx Extractor
+Streamx Extractor
 
 Kotlin library to extract YouTube video info and streams.
 
-[![](https://jitpack.io/v/streamxap-create/Streamx-extractor.svg)](https://jitpack.io/#streamxap-create/Streamx-extractor)
+---
 
-## Installation
+Installation
 
-### Step 1: Add JitPack repository
+Teen files mein code add karna hai.
 
-Add this in your root settings.gradle.kts:
+File 1: settings.gradle.kts (Project Root)
 
-```kotlin
 dependencyResolutionManagement {
     repositories {
         google()
@@ -18,3 +17,37 @@ dependencyResolutionManagement {
         maven { url = uri("https://jitpack.io") }
     }
 }
+
+File 2: build.gradle.kts (App Module)
+
+dependencies {
+    implementation("com.github.streamxap-create:Streamx-extractor:v1.0.1")
+}
+
+File 3: Main.kt
+
+import com.streamx.extractor.StreamxExtractor
+
+fun main() {
+    val video = StreamxExtractor.getVideo("dQw4w9WgXcQ")
+
+    println("Title: ${video.title}")
+    println("Channel: ${video.channelName}")
+    println("Duration: ${video.duration}s")
+    println("Views: ${video.viewCount}")
+}
+
+---
+
+Features
+
+- Video info (title, description, duration, channel, views)
+- Stream URLs (video + audio)
+- Thumbnails
+- Built with Kotlin
+
+---
+
+License
+
+MIT License
