@@ -1,0 +1,10 @@
+# Streamx Extractor
+
+Kotlin library to extract YouTube video info and streams.
+
+## Usage
+
+```kotlin
+val video = StreamxExtractor.getVideo("dQw4w9WgXcQ")
+println(video.title)
+println(video.streams.size)
