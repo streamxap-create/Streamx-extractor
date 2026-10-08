@@ -7,6 +7,7 @@ import com.streamx.extractor.model.ClientReport
 import com.streamx.extractor.model.Stream
 import com.streamx.extractor.model.Thumbnail
 import com.streamx.extractor.model.Video
+import com.streamx.extractor.model.VideoItem
 
 class YoutubeExtractor(
     private val downloader: Downloader = Downloader()
@@ -27,25 +28,8 @@ class YoutubeExtractor(
 
     private class Attempt(val video: Video?, val report: ClientReport)
 
-    // Order: pehla jo streams de wahi use hota hai
+    // Real device test: ANDROID aur IOS ke URL chalte hain (206), ANDROID_VR ka 403 aata hai -> last mein
     private val clients = listOf(
-        ClientConfig(
-            name = "ANDROID_VR",
-            clientJson = """
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.65.10",
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "androidSdkVersion": 32,
-                "osName": "Android",
-                "osVersion": "12L",
-                "hl": "en",
-                "gl": "IN"
-            """,
-            userAgent = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
-            clientNameId = "28",
-            clientVersion = "1.65.10"
-        ),
         ClientConfig(
             name = "ANDROID",
             clientJson = """
@@ -78,17 +62,21 @@ class YoutubeExtractor(
             clientVersion = "20.10.4"
         ),
         ClientConfig(
-            name = "TV_EMBEDDED",
+            name = "ANDROID_VR",
             clientJson = """
-                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-                "clientVersion": "2.0",
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.65.10",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "androidSdkVersion": 32,
+                "osName": "Android",
+                "osVersion": "12L",
                 "hl": "en",
                 "gl": "IN"
             """,
-            userAgent = "Mozilla/5.0 (ChromiumStylePlatform) Cobalt/Version",
-            clientNameId = "85",
-            clientVersion = "2.0",
-            extraContext = ""","thirdParty": {"embedUrl": "https://www.youtube.com/"}"""
+            userAgent = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
+            clientNameId = "28",
+            clientVersion = "1.65.10"
         )
     )
 
@@ -134,7 +122,9 @@ class YoutubeExtractor(
                 channelId = details["channelId"] as? String ?: "",
                 viewCount = (details["viewCount"] as? String)?.toLongOrNull() ?: 0L,
                 thumbnails = parseThumbnails(details),
-                streams = parseStreams(root["streamingData"] as? Map<*, *>)
+                streams = parseStreams(root["streamingData"] as? Map<*, *>),
+                userAgent = c.userAgent,
+                client = c.name
             )
 
             val probeCode = if (probe && video.streams.isNotEmpty())
@@ -158,22 +148,91 @@ class YoutubeExtractor(
         var fallback: Video? = null
 
         for (c in clients) {
-            val a = attempt(c, videoId, probe = false)
+            val a = attempt(c, videoId, probe = true)
             val v = a.video
-            if (v != null) {
-                if (v.streams.isNotEmpty()) return v
-                if (fallback == null) fallback = v
-                errors.add("${c.name}: info mila par stream URLs nahi (${a.report.playability})")
-            } else {
+            if (v == null) {
                 val r = a.report
                 errors.add("${c.name}: ${r.error ?: "${r.playability} ${r.reason ?: ""}".trim()}")
+                continue
             }
+            if (v.streams.isEmpty()) {
+                if (fallback == null) fallback = v
+                errors.add("${c.name}: stream URLs nahi (${a.report.playability})")
+                continue
+            }
+            val code = a.report.probeHttpCode
+            if (code == 200 || code == 206) return v      // URL sach mein chalta hai
+            if (fallback == null) fallback = v
+            errors.add("${c.name}: URL block (HTTP $code)")
         }
         return fallback ?: throw Exception("Video load fail ($videoId) -> " + errors.joinToString(" | "))
     }
 
     fun diagnose(videoId: String): List<ClientReport> =
         clients.map { attempt(it, videoId, probe = true).report }
+
+    // ---------- Search / Home feed ----------
+    private val webClientJson = mapOf(
+        "clientName" to "WEB",
+        "clientVersion" to "2.20250101.00.00",
+        "hl" to "en",
+        "gl" to "IN"
+    )
+
+    fun search(query: String): List<VideoItem> {
+        val body = mapOf(
+            "context" to mapOf("client" to webClientJson),
+            "query" to query
+        )
+        val payload = moshi.adapter(Map::class.java).toJson(body)
+        val headers = mapOf(
+            "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+            "X-YouTube-Client-Name" to "1",
+            "X-YouTube-Client-Version" to "2.20250101.00.00",
+            "Origin" to "https://www.youtube.com"
+        )
+        val url = "https://www.youtube.com/youtubei/v1/search" +
+            "?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false"
+
+        val response = downloader.postJson(url, payload, headers)
+        val root = moshi.adapter(Map::class.java).fromJson(response) as Map<*, *>
+
+        val renderers = mutableListOf<Map<*, *>>()
+        collectVideoRenderers(root, renderers)
+
+        val seen = HashSet<String>()
+        return renderers.mapNotNull { r ->
+            val id = r["videoId"] as? String ?: return@mapNotNull null
+            if (!seen.add(id)) return@mapNotNull null
+            VideoItem(
+                id = id,
+                title = textOf(r["title"]),
+                channelName = textOf(r["ownerText"]).ifEmpty { textOf(r["longBylineText"]) },
+                duration = textOf(r["lengthText"]),
+                views = textOf(r["viewCountText"]).ifEmpty { textOf(r["shortViewCountText"]) },
+                published = textOf(r["publishedTimeText"]),
+                thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg"
+            )
+        }
+    }
+
+    // JSON mein kahin bhi "videoRenderer" mile to utha lo (layout badle to bhi chalega)
+    private fun collectVideoRenderers(node: Any?, out: MutableList<Map<*, *>>) {
+        when (node) {
+            is Map<*, *> -> {
+                (node["videoRenderer"] as? Map<*, *>)?.let { out.add(it) }
+                node.values.forEach { collectVideoRenderers(it, out) }
+            }
+            is List<*> -> node.forEach { collectVideoRenderers(it, out) }
+        }
+    }
+
+    private fun textOf(node: Any?): String {
+        val m = node as? Map<*, *> ?: return ""
+        (m["simpleText"] as? String)?.let { return it }
+        val runs = m["runs"] as? List<*> ?: return ""
+        return runs.joinToString("") { (it as? Map<*, *>)?.get("text") as? String ?: "" }
+    }
 
     private fun parseThumbnails(details: Map<*, *>): List<Thumbnail> {
         val thumb = details["thumbnail"] as? Map<*, *> ?: return emptyList()
