@@ -15,7 +15,8 @@ data class Video(
     val hlsUrl: String = "",       // HLS manifest (bonus fallback)
     val hlsUserAgent: String = "",
     val hlsMaxHeight: Int = 0,
-    val log: String = ""           // har client ka short report (debug ke liye screen par dikha sakte ho)
+    val log: String = "",          // har client ka short report (debug ke liye screen par dikha sakte ho)
+    val alternates: List<Video> = emptyList()   // doosre clients jinki adaptive streams verify hui (best fail ho to inhe try karo)
 ) {
     /** Alag video-only streams (sirf wo jo verify ho chuki hain) */
     val videoOnlyStreams: List<Stream>
