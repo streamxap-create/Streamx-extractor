@@ -60,4 +60,17 @@ class Downloader {
             -1
         }
     }
+
+    // Simple GET (HLS manifest padhne ke liye). Fail ho to null.
+    fun getText(url: String, headers: Map<String, String> = emptyMap()): String? {
+        val builder = Request.Builder().url(url).get()
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        return try {
+            client.newCall(builder.build()).execute().use { r ->
+                if (r.isSuccessful) r.body?.string() else null
+            }
+        } catch (e: Exception) {
+            null
+        }
+    }
 }
