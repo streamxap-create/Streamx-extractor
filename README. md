@@ -21,7 +21,7 @@ dependencyResolutionManagement {
 File 2: build.gradle.kts (App Module)
 
 dependencies {
-    implementation("com.github.streamxap-create:Streamx-extractor:v1.0.1")
+    implementation("com.github.streamxap-create:Streamx-extractor:V1.0.7")
 }
 
 File 3: Main.kt
@@ -42,7 +42,9 @@ fun main() {
 Features
 
 - Video info (title, description, duration, channel, views)
-- Stream URLs (video + audio)
+- Stream URLs: 1080p+ video-only + audio-only (merge karke chalao), 360p muxed backup
+- Har URL pehle test hota hai (403 wali stream list se hat jati hai)
+- video.log mein har client ka report
 - Thumbnails
 - Built with Kotlin
 
@@ -51,3 +53,14 @@ Features
 License
 
 MIT License
+
+---
+
+Player mein kaise lagayen (Media3)
+
+val v = StreamxExtractor.getVideo(id)
+val vs = v.pickVideo(1080)     // video-only
+val au = v.pickAudio()         // audio-only
+// MergingMediaSource(progressive(vs), progressive(au))
+// har stream ka apna stream.userAgent hota hai
+// URL par open-ended Range 403 deta hai, isliye 10MB chunks mein maango (ChunkedHttpDataSource)
