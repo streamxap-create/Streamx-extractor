@@ -10,12 +10,66 @@ data class Video(
     val viewCount: Long,
     val thumbnails: List<Thumbnail>,
     val streams: List<Stream> = emptyList(),
-    val userAgent: String = "",   // stream URL isi User-Agent se chalta hai (player mein lagao)
-    val client: String = "",      // kaunse client se mila
-    val hlsUrl: String = "",      // HLS manifest (adaptive, 1080p tak) - bina PO token ke chal sakta hai
-    val hlsUserAgent: String = "", // HLS ke liye User-Agent
-    val hlsMaxHeight: Int = 0      // HLS manifest mein sabse badi quality (1080 etc), 0 = pata nahi
-)
+    val userAgent: String = "",    // purana field: best client ka User-Agent
+    val client: String = "",       // best client ka naam
+    val hlsUrl: String = "",       // HLS manifest (bonus fallback)
+    val hlsUserAgent: String = "",
+    val hlsMaxHeight: Int = 0,
+    val log: String = ""           // har client ka short report (debug ke liye screen par dikha sakte ho)
+) {
+    /** Alag video-only streams (sirf wo jo verify ho chuki hain) */
+    val videoOnlyStreams: List<Stream>
+        get() = streams.filter { it.isVideo && it.adaptive }
+
+    val audioStreams: List<Stream>
+        get() = streams.filter { it.isAudio }
+
+    /** Video+audio ek file wali streams (itag 18 = 360p) */
+    val muxedStreams: List<Stream>
+        get() = streams.filter { it.isVideo && !it.adaptive }
+
+    /** Merge ho sakne wali (video-only + audio) qualities aur muxed qualities, bade se chhote */
+    val availableHeights: List<Int>
+        get() {
+            val list = mutableListOf<Int>()
+            if (audioStreams.isNotEmpty()) list += videoOnlyStreams.map { it.height }
+            list += muxedStreams.map { it.height }
+            return list.filter { it > 0 }.distinct().sortedDescending()
+        }
+
+    /** Sabse badi playable height */
+    val bestHeight: Int get() = availableHeights.firstOrNull() ?: 0
+
+    /**
+     * maxHeight tak ki sabse achi video-only stream. Same height par avc1 (H.264) ko pehle rakhta hai
+     * kyunki har phone par hardware decode hota hai. Kuch na mile to sabse choti stream deta hai.
+     */
+    fun pickVideo(maxHeight: Int): Stream? {
+        val vids = videoOnlyStreams
+        if (vids.isEmpty()) return null
+        fun codecRank(s: Stream) = when {
+            s.isAvc -> 3
+            s.isVp9 -> 2
+            else -> 1
+        }
+        val fit = vids.filter { it.height in 1..maxHeight }
+        if (fit.isEmpty()) return vids.minByOrNull { it.height }
+        return fit.maxWithOrNull(
+            compareBy<Stream>({ it.height }, { codecRank(it) }, { it.bitrate })
+        )
+    }
+
+    /** Sabse achi audio (m4a/AAC ko pehle rakhta hai) */
+    fun pickAudio(): Stream? {
+        val a = audioStreams
+        if (a.isEmpty()) return null
+        return a.maxWithOrNull(compareBy<Stream>({ if (it.isMp4) 1 else 0 }, { it.bitrate }))
+    }
+
+    /** Aakhri safe option: video+audio ek file (itag 18) */
+    fun pickMuxed(): Stream? =
+        muxedStreams.firstOrNull { it.itag == 18 } ?: muxedStreams.maxByOrNull { it.height }
+}
 
 data class Thumbnail(
     val url: String,
@@ -31,8 +85,11 @@ data class ClientReport(
     val reason: String?,
     val streamCount: Int,
     val itags: List<Int>,
-    val probeHttpCode: Int?,       // pehle stream URL ka test (200/206 = chalega, 403 = block)
-    val error: String?
+    val probeHttpCode: Int?,       // muxed stream ka test (200/206 = chalega, 403 = block)
+    val error: String?,
+    val maxHeight: Int = 0,        // is client se sabse badi height
+    val videoProbe: Int? = null,   // adaptive video URL ka test
+    val audioProbe: Int? = null    // adaptive audio URL ka test
 )
 
 // Search / home feed ka ek item
