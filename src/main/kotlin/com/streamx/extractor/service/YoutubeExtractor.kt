@@ -145,6 +145,22 @@ class YoutubeExtractor(
 
     private fun isOk(code: Int?) = code == 200 || code == 206
 
+    /**
+     * Player jaisa test: pehle 10MB ki Range (ExoPlayer ka pehla chunk), phir file ke beech se doosri Range.
+     * Kuch URLs shuru ke 2 byte de dete hain par asli request par 403 dete hain.
+     */
+    private fun deepProbe(s: Stream, h: Map<String, String>): Int {
+        val chunk = 10L * 1024 * 1024
+        val head = downloader.probeRange(s.url, h, 0, chunk - 1)
+        if (!isOk(head)) return head
+        val len = s.contentLength
+        if (len > 4L * 1024 * 1024) {
+            val mid = len / 2
+            return downloader.probeRange(s.url, h, mid, minOf(mid + chunk - 1, len - 1))
+        }
+        return head
+    }
+
     private class Verified(
         val video: Video,
         val muxedProbe: Int?,
@@ -165,10 +181,10 @@ class YoutubeExtractor(
         val vids = v.videoOnlyStreams
         val vidTop = vids.filter { it.isMp4 && it.height <= 1080 }.maxByOrNull { it.height }
             ?: vids.maxByOrNull { it.height }
-        val vidCode = vidTop?.let { downloader.probe(it.url, h) }
+        val vidCode = vidTop?.let { deepProbe(it, h) }
 
         val audTop = v.pickAudio()
-        val audCode = audTop?.let { downloader.probe(it.url, h) }
+        val audCode = audTop?.let { deepProbe(it, h) }
 
         val adaptiveOk = isOk(vidCode) && isOk(audCode)
         val keep = v.streams.filter { s ->
@@ -215,8 +231,6 @@ class YoutubeExtractor(
                 continue
             }
             good.add(ver.video)
-            // 1080p+ mil gayi to baaki clients ko tang karne ki zarurat nahi
-            if (ver.video.bestHeight >= 1080) break
         }
 
         if (good.isEmpty()) {
@@ -227,9 +241,14 @@ class YoutubeExtractor(
         // Doosre clients ki working muxed (360p) streams backup ke taur par jod do
         val extraMuxed = good.filter { it !== best }.flatMap { it.muxedStreams }
             .filter { e -> best.streams.none { it.itag == e.itag } }
+        // Best ki adaptive fail ho to player inhe try kare
+        val alts = good.filter { it !== best && it.videoOnlyStreams.isNotEmpty() && it.audioStreams.isNotEmpty() }
+            .sortedByDescending { it.bestHeight }
+            .map { it.copy(alternates = emptyList(), log = "") }
         val merged = best.copy(
             streams = best.streams + extraMuxed,
-            log = log.joinToString("\n")
+            log = log.joinToString("\n"),
+            alternates = alts
         )
         // HLS sirf tab dekho jab adaptive se 720p se kam mili
         return if (merged.bestHeight >= 720) merged else withHls(merged, videoId)
