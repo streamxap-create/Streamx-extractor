@@ -17,3 +17,15 @@ data class Thumbnail(
     val width: Int,
     val height: Int
 )
+
+// diagnose() ka result: har YouTube client ka alag report
+data class ClientReport(
+    val client: String,
+    val gotInfo: Boolean,          // videoDetails mila?
+    val playability: String?,      // OK / LOGIN_REQUIRED / UNPLAYABLE ...
+    val reason: String?,
+    val streamCount: Int,
+    val itags: List<Int>,
+    val probeHttpCode: Int?,       // pehle stream URL ka test (200/206 = chalega, 403 = block)
+    val error: String?
+)
