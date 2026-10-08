@@ -84,7 +84,7 @@ class YoutubeExtractor(
     private val apiUrl = "https://www.youtube.com/youtubei/v1/player" +
         "?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w&prettyPrint=false"
 
-    private fun attempt(c: ClientConfig, videoId: String, probe: Boolean): Attempt {
+    private fun attempt(c: ClientConfig, videoId: String): Attempt {
         return try {
             val payload = """
                 {
@@ -114,6 +114,7 @@ class YoutubeExtractor(
                 return Attempt(null, ClientReport(c.name, false, status, reason, 0, emptyList(), null, null))
             }
 
+            val sd = root["streamingData"] as? Map<*, *>
             val video = Video(
                 id = videoId,
                 title = details["title"] as? String ?: "",
@@ -123,22 +124,18 @@ class YoutubeExtractor(
                 channelId = details["channelId"] as? String ?: "",
                 viewCount = (details["viewCount"] as? String)?.toLongOrNull() ?: 0L,
                 thumbnails = parseThumbnails(details),
-                streams = parseStreams(root["streamingData"] as? Map<*, *>),
+                streams = parseStreams(sd, c),
                 userAgent = c.userAgent,
                 client = c.name,
-                hlsUrl = (root["streamingData"] as? Map<*, *>)?.get("hlsManifestUrl") as? String ?: "",
+                hlsUrl = sd?.get("hlsManifestUrl") as? String ?: "",
                 hlsUserAgent = c.userAgent
             )
-
-            val probeCode = if (probe && video.streams.isNotEmpty())
-                downloader.probe(video.streams.first().url, mapOf("User-Agent" to c.userAgent))
-            else null
 
             Attempt(
                 video,
                 ClientReport(
                     c.name, true, status, reason,
-                    video.streams.size, video.streams.map { it.itag }.distinct(), probeCode, null
+                    video.streams.size, video.streams.map { it.itag }.distinct(), null, null
                 )
             )
         } catch (e: Exception) {
@@ -146,39 +143,104 @@ class YoutubeExtractor(
         }
     }
 
-    fun getVideo(videoId: String): Video {
-        val errors = mutableListOf<String>()
-        var fallback: Video? = null
+    private fun isOk(code: Int?) = code == 200 || code == 206
 
-        for (c in clients) {
-            val a = attempt(c, videoId, probe = true)
-            val v = a.video
-            if (v == null) {
-                val r = a.report
-                errors.add("${c.name}: ${r.error ?: "${r.playability} ${r.reason ?: ""}".trim()}")
-                continue
-            }
-            if (v.streams.isEmpty()) {
-                if (fallback == null) fallback = v
-                errors.add("${c.name}: stream URLs nahi (${a.report.playability})")
-                continue
-            }
-            val code = a.report.probeHttpCode
-            if (code == 200 || code == 206) return withHls(v, videoId)   // URL sach mein chalta hai
-            if (fallback == null) fallback = v
-            errors.add("${c.name}: URL block (HTTP $code)")
+    private class Verified(
+        val video: Video,
+        val muxedProbe: Int?,
+        val videoProbe: Int?,
+        val audioProbe: Int?
+    )
+
+    /**
+     * Har type ki sabse achi stream ka URL sach mein khol ke dekhta hai (2 byte maang kar).
+     * Jo URL 403 de uske streams hata deta hai, taake player kabhi kharab URL par na jaye.
+     */
+    private fun verify(c: ClientConfig, v: Video): Verified {
+        val h = mapOf("User-Agent" to c.userAgent)
+
+        val muxedTop = v.muxedStreams.maxByOrNull { it.height }
+        val muxedCode = muxedTop?.let { downloader.probe(it.url, h) }
+
+        val vids = v.videoOnlyStreams
+        val vidTop = vids.filter { it.isMp4 && it.height <= 1080 }.maxByOrNull { it.height }
+            ?: vids.maxByOrNull { it.height }
+        val vidCode = vidTop?.let { downloader.probe(it.url, h) }
+
+        val audTop = v.pickAudio()
+        val audCode = audTop?.let { downloader.probe(it.url, h) }
+
+        val adaptiveOk = isOk(vidCode) && isOk(audCode)
+        val keep = v.streams.filter { s ->
+            if (s.isVideo && !s.adaptive) isOk(muxedCode) else adaptiveOk
         }
-        return fallback?.let { withHls(it, videoId) }
-            ?: throw Exception("Video load fail ($videoId) -> " + errors.joinToString(" | "))
+        return Verified(v.copy(streams = keep), muxedCode, vidCode, audCode)
     }
 
-    // HLS manifest (adaptive 1080p) IOS client se aata hai; ANDROID wale video mein jod do.
-    // Manifest sach mein khulta hai ya nahi check karta hai aur sabse badi quality nikalta hai.
+    private fun reportOf(c: ClientConfig, a: Attempt, ver: Verified?): ClientReport {
+        val r = a.report
+        if (ver == null) return r
+        return r.copy(
+            probeHttpCode = ver.muxedProbe,
+            videoProbe = ver.videoProbe,
+            audioProbe = ver.audioProbe,
+            maxHeight = ver.video.bestHeight
+        )
+    }
+
+    private fun logLine(c: ClientConfig, a: Attempt, ver: Verified?): String {
+        val r = a.report
+        if (a.video == null) return "${c.name}: ${r.error ?: "${r.playability} ${r.reason ?: ""}".trim()}"
+        if (ver == null) return "${c.name}: stream URLs nahi (${r.playability})"
+        return "${c.name}: ${ver.video.bestHeight}p (mux ${ver.muxedProbe ?: "-"}, vid ${ver.videoProbe ?: "-"}, aud ${ver.audioProbe ?: "-"})"
+    }
+
+    fun getVideo(videoId: String): Video {
+        val errors = mutableListOf<String>()
+        val log = mutableListOf<String>()
+        val good = mutableListOf<Video>()
+
+        for (c in clients) {
+            val a = attempt(c, videoId)
+            val v = a.video
+            if (v == null || v.streams.isEmpty()) {
+                log.add(logLine(c, a, null))
+                errors.add(log.last())
+                continue
+            }
+            val ver = verify(c, v)
+            log.add(logLine(c, a, ver))
+            if (ver.video.streams.isEmpty()) {
+                errors.add(log.last())
+                continue
+            }
+            good.add(ver.video)
+            // 1080p+ mil gayi to baaki clients ko tang karne ki zarurat nahi
+            if (ver.video.bestHeight >= 1080) break
+        }
+
+        if (good.isEmpty()) {
+            throw Exception("Video load fail ($videoId) -> " + errors.joinToString(" | "))
+        }
+
+        val best = good.maxByOrNull { it.bestHeight }!!
+        // Doosre clients ki working muxed (360p) streams backup ke taur par jod do
+        val extraMuxed = good.filter { it !== best }.flatMap { it.muxedStreams }
+            .filter { e -> best.streams.none { it.itag == e.itag } }
+        val merged = best.copy(
+            streams = best.streams + extraMuxed,
+            log = log.joinToString("\n")
+        )
+        // HLS sirf tab dekho jab adaptive se 720p se kam mili
+        return if (merged.bestHeight >= 720) merged else withHls(merged, videoId)
+    }
+
+    // HLS manifest (bonus fallback) IOS client se aata hai. Manifest sach mein khulta hai ya nahi check karta hai.
     private fun withHls(v: Video, videoId: String): Video {
         if (v.hlsUrl.isNotEmpty()) return v
         val ios = clients.firstOrNull { it.name == "IOS" } ?: return v
         return try {
-            val url = attempt(ios, videoId, probe = false).video?.hlsUrl.orEmpty()
+            val url = attempt(ios, videoId).video?.hlsUrl.orEmpty()
             if (url.isEmpty()) return v
             val text = downloader.getText(url, mapOf("User-Agent" to ios.userAgent))
             if (text == null || !text.contains("#EXTM3U")) return v
@@ -191,7 +253,11 @@ class YoutubeExtractor(
     }
 
     fun diagnose(videoId: String): List<ClientReport> =
-        clients.map { attempt(it, videoId, probe = true).report }
+        clients.map { c ->
+            val a = attempt(c, videoId)
+            val v = a.video
+            if (v == null || v.streams.isEmpty()) a.report else reportOf(c, a, verify(c, v))
+        }
 
     // ---------- Search / Home feed ----------
     private val webClientJson = mapOf(
@@ -307,31 +373,42 @@ class YoutubeExtractor(
         }
     }
 
-    private fun parseStreams(data: Map<*, *>?): List<Stream> {
+    private fun parseStreams(data: Map<*, *>?, c: ClientConfig): List<Stream> {
         if (data == null) return emptyList()
 
         val result = mutableListOf<Stream>()
         val formats = (data["formats"] as? List<*>) ?: emptyList<Any>()
         val adaptive = (data["adaptiveFormats"] as? List<*>) ?: emptyList<Any>()
+        val codecRegex = Regex("codecs=\"([^\"]+)\"")
 
-        (formats + adaptive).forEach { item ->
-            val f = item as? Map<*, *> ?: return@forEach
-            val mime = f["mimeType"] as? String ?: return@forEach
-            val url = f["url"] as? String ?: return@forEach
+        fun add(item: Any?, isAdaptive: Boolean) {
+            val f = item as? Map<*, *> ?: return
+            val mime = f["mimeType"] as? String ?: return
+            val url = f["url"] as? String ?: return   // signatureCipher wali streams skip
 
             result.add(
                 Stream(
                     url = url,
                     itag = (f["itag"] as? Number)?.toInt() ?: 0,
                     mimeType = mime,
-                    quality = f["qualityLabel"] as? String ?: "unknown",
+                    quality = f["qualityLabel"] as? String ?: (f["audioQuality"] as? String ?: "unknown"),
                     bitrate = (f["bitrate"] as? Number)?.toInt() ?: 0,
                     isVideo = mime.startsWith("video"),
-                    isAudio = mime.startsWith("audio")
+                    isAudio = mime.startsWith("audio"),
+                    adaptive = isAdaptive,
+                    width = (f["width"] as? Number)?.toInt() ?: 0,
+                    height = (f["height"] as? Number)?.toInt() ?: 0,
+                    fps = (f["fps"] as? Number)?.toInt() ?: 0,
+                    contentLength = (f["contentLength"] as? String)?.toLongOrNull() ?: 0L,
+                    codecs = codecRegex.find(mime)?.groupValues?.get(1)?.substringBefore(',')?.trim() ?: "",
+                    client = c.name,
+                    userAgent = c.userAgent
                 )
             )
         }
+
+        formats.forEach { add(it, false) }
+        adaptive.forEach { add(it, true) }
         return result
     }
-                           }
-                           
+}
