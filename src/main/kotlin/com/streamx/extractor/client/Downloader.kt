@@ -10,35 +10,54 @@ class Downloader {
 
     private val client = OkHttpClient.Builder()
         .addInterceptor { chain ->
-            val request = chain.request().newBuilder()
-                .header(
+            val original = chain.request()
+            val builder = original.newBuilder()
+            if (original.header("User-Agent") == null) {
+                builder.header(
                     "User-Agent",
-                    "com.google.android.youtube/19.09.37 (Linux; U; Android 11) gzip"
+                    "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip"
                 )
-                .header("Accept-Language", "en-US,en;q=0.9")
-                .build()
-            chain.proceed(request)
+            }
+            builder.header("Accept-Language", "en-US,en;q=0.9")
+            chain.proceed(builder.build())
         }
         .build()
 
     private val JSON = "application/json".toMediaType()
 
-    fun postJson(url: String, jsonBody: String): String {
+    fun postJson(
+        url: String,
+        jsonBody: String,
+        headers: Map<String, String> = emptyMap()
+    ): String {
         val body = jsonBody.toRequestBody(JSON)
-        val request = Request.Builder()
+        val builder = Request.Builder()
             .url(url)
             .post(body)
-            .build()
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        val request = builder.build()
 
         return try {
             client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    throw IOException("HTTP ${response.code}: ${response.message}")
+                    val errBody = try { response.body?.string()?.take(500) } catch (e: Exception) { null }
+                    throw IOException("HTTP ${response.code}: ${response.message} ${errBody ?: ""}".trim())
                 }
                 response.body?.string() ?: throw IOException("Empty response body")
             }
         } catch (e: IOException) {
             throw IOException("Network error: ${e.message}", e)
+        }
+    }
+
+    // Stream URL chalta hai ya nahi: sirf pehle 2 bytes maangta hai, HTTP code wapas deta hai (-1 = network fail)
+    fun probe(url: String, headers: Map<String, String> = emptyMap()): Int {
+        val builder = Request.Builder().url(url).get().header("Range", "bytes=0-1")
+        headers.forEach { (k, v) -> builder.header(k, v) }
+        return try {
+            client.newCall(builder.build()).execute().use { it.code }
+        } catch (e: Exception) {
+            -1
         }
     }
 }
