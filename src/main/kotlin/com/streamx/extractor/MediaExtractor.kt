@@ -2,6 +2,7 @@ package com.streamx.extractor
 
 import com.streamx.extractor.model.ClientReport
 import com.streamx.extractor.model.Video
+import com.streamx.extractor.model.VideoItem
 import com.streamx.extractor.service.YoutubeExtractor
 
 object StreamxExtractor {
@@ -15,5 +16,9 @@ object StreamxExtractor {
     fun diagnose(videoId: String): List<ClientReport> {
         return youtube.diagnose(videoId)
     }
-}
 
+    /** Search / home feed: video list deta hai */
+    fun search(query: String): List<VideoItem> {
+        return youtube.search(query)
+    }
+}
