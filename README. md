@@ -21,7 +21,7 @@ dependencyResolutionManagement {
 File 2: build.gradle.kts (App Module)
 
 dependencies {
-    implementation("com.github.streamxap-create:Streamx-extractor:V1.0.7")
+    implementation("com.github.streamxap-create:Streamx-extractor:V1.0.9")
 }
 
 File 3: Main.kt
