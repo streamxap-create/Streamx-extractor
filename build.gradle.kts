@@ -15,10 +15,15 @@ dependencies {
     implementation("com.squareup.moshi:moshi:1.15.1")
     implementation("com.squareup.moshi:moshi-kotlin:1.15.1")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    testImplementation(kotlin("test"))
 }
 
 kotlin {
     jvmToolchain(17)
+}
+
+tasks.test {
+    useJUnitPlatform()
 }
 
 publishing {
