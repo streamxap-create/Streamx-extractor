@@ -24,43 +24,33 @@ class YoutubeExtractor(
         val userAgent: String,
         val clientNameId: String,
         val clientVersion: String,
-        val extraContext: String = ""   // context level ka extra JSON, jaise thirdParty
+        val extraContext: String = "",   // context level ka extra JSON, jaise thirdParty
+        val chunkSize: Long = 0L         // is client ke URL par ek request mein itne bytes se zyada maangna 403 deta hai (0 = had nahi)
     )
 
     private class Attempt(val video: Video?, val report: ClientReport)
 
-    // Real device test: ANDROID aur IOS ke URL chalte hain (206), ANDROID_VR ka 403 aata hai -> last mein
+    // NewPipe (v0.28.8+) ne SABR/PO-token ka hal VISIONOS client se nikala: iske URL bina PO token ke
+    // 1080p+ deti hain aur bade Range bhi accept karti hain. ANDROID_VR/ANDROID/IOS sirf ~1MiB tak ki
+    // bounded Range accept karti hain (open-ended ya bada Range = 403), isliye unka chunkSize chhota hai.
+    private val smallChunk = 786_432L
+
     private val clients = listOf(
         ClientConfig(
-            name = "ANDROID",
+            name = "VISIONOS",
             clientJson = """
-                "clientName": "ANDROID",
-                "clientVersion": "20.10.38",
-                "androidSdkVersion": 30,
-                "osName": "Android",
-                "osVersion": "11",
-                "hl": "en",
-                "gl": "IN"
-            """,
-            userAgent = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
-            clientNameId = "3",
-            clientVersion = "20.10.38"
-        ),
-        ClientConfig(
-            name = "IOS",
-            clientJson = """
-                "clientName": "IOS",
-                "clientVersion": "20.10.4",
+                "clientName": "VISIONOS",
+                "clientVersion": "1.02",
                 "deviceMake": "Apple",
-                "deviceModel": "iPhone16,2",
-                "osName": "iPhone",
-                "osVersion": "18.3.2.22D82",
+                "deviceModel": "RealityDevice17,1",
+                "osName": "visionOS",
+                "osVersion": "26.5.23O471",
                 "hl": "en",
                 "gl": "IN"
             """,
-            userAgent = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
-            clientNameId = "5",
-            clientVersion = "20.10.4"
+            userAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15",
+            clientNameId = "101",
+            clientVersion = "1.02"
         ),
         ClientConfig(
             name = "ANDROID_VR",
@@ -77,30 +67,83 @@ class YoutubeExtractor(
             """,
             userAgent = "com.google.android.apps.youtube.vr.oculus/1.65.10 (Linux; U; Android 12L; eureka-user Build/SQ3A.220605.009.A1) gzip",
             clientNameId = "28",
-            clientVersion = "1.65.10"
+            clientVersion = "1.65.10",
+            chunkSize = smallChunk
+        ),
+        ClientConfig(
+            name = "ANDROID",
+            clientJson = """
+                "clientName": "ANDROID",
+                "clientVersion": "20.10.38",
+                "androidSdkVersion": 30,
+                "osName": "Android",
+                "osVersion": "11",
+                "hl": "en",
+                "gl": "IN"
+            """,
+            userAgent = "com.google.android.youtube/20.10.38 (Linux; U; Android 11) gzip",
+            clientNameId = "3",
+            clientVersion = "20.10.38",
+            chunkSize = smallChunk
+        ),
+        ClientConfig(
+            name = "IOS",
+            clientJson = """
+                "clientName": "IOS",
+                "clientVersion": "20.10.4",
+                "deviceMake": "Apple",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "18.3.2.22D82",
+                "hl": "en",
+                "gl": "IN"
+            """,
+            userAgent = "com.google.ios.youtube/20.10.4 (iPhone16,2; U; CPU iOS 18_3_2 like Mac OS X;)",
+            clientNameId = "5",
+            clientVersion = "20.10.4",
+            chunkSize = smallChunk
         )
     )
+
+    // YouTube /player ke liye visitorData maangta hai (NewPipe/yt-dlp bhi bhejte hain). Ek baar le kar yaad rakhta hai.
+    private val visitorData: String by lazy {
+        try {
+            val html = downloader.getText(
+                "https://www.youtube.com/",
+                mapOf(
+                    "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+                    "Accept-Language" to "en-US,en;q=0.9"
+                )
+            ) ?: ""
+            Regex("\"visitorData\":\"([^\"]+)\"").find(html)?.groupValues?.get(1) ?: ""
+        } catch (e: Exception) {
+            ""
+        }
+    }
 
     private val apiUrl = "https://www.youtube.com/youtubei/v1/player" +
         "?key=AIzaSyA8eiZmM1FaDVjRy-df2KTyQ_vz_yYM39w&prettyPrint=false"
 
     private fun attempt(c: ClientConfig, videoId: String): Attempt {
         return try {
+            val vd = visitorData
+            val vdJson = if (vd.isNotBlank()) ", \"visitorData\": \"$vd\"" else ""
             val payload = """
                 {
-                  "context": { "client": { ${c.clientJson.trim()} }${c.extraContext} },
+                  "context": { "client": { ${c.clientJson.trim()}$vdJson }${c.extraContext} },
                   "videoId": "$videoId",
                   "contentCheckOk": true,
                   "racyCheckOk": true
                 }
             """.trimIndent()
 
-            val headers = mapOf(
+            val headers = mutableMapOf(
                 "User-Agent" to c.userAgent,
                 "X-YouTube-Client-Name" to c.clientNameId,
                 "X-YouTube-Client-Version" to c.clientVersion,
                 "Origin" to "https://www.youtube.com"
             )
+            if (vd.isNotBlank()) headers["X-Goog-Visitor-Id"] = vd
 
             val response = downloader.postJson(apiUrl, payload, headers)
             val root = moshi.adapter(Map::class.java).fromJson(response) as Map<*, *>
@@ -150,7 +193,7 @@ class YoutubeExtractor(
      * Kuch URLs shuru ke 2 byte de dete hain par asli request par 403 dete hain.
      */
     private fun deepProbe(s: Stream, h: Map<String, String>): Int {
-        val chunk = 10L * 1024 * 1024
+        val chunk = if (s.chunkSize > 0) s.chunkSize else 10L * 1024 * 1024
         val head = downloader.probeRange(s.url, h, 0, chunk - 1)
         if (!isOk(head)) return head
         val len = s.contentLength
@@ -167,7 +210,7 @@ class YoutubeExtractor(
         val videoProbe: Int?,
         val audioProbe: Int?
     )
-
+    
     /**
      * Har type ki sabse achi stream ka URL sach mein khol ke dekhta hai (2 byte maang kar).
      * Jo URL 403 de uske streams hata deta hai, taake player kabhi kharab URL par na jaye.
@@ -231,6 +274,8 @@ class YoutubeExtractor(
                 continue
             }
             good.add(ver.video)
+            // 1080p+ aur kam az kam 2 chalne wale clients mil gaye to baaki ko tang na karo
+            if (ver.video.bestHeight >= 1080 && good.size >= 2) break
         }
 
         if (good.isEmpty()) {
@@ -255,19 +300,27 @@ class YoutubeExtractor(
     }
 
     // HLS manifest (bonus fallback) IOS client se aata hai. Manifest sach mein khulta hai ya nahi check karta hai.
+    // Natija log mein likhta hai taake pata chale HLS kyun nahi mila.
     private fun withHls(v: Video, videoId: String): Video {
         if (v.hlsUrl.isNotEmpty()) return v
         val ios = clients.firstOrNull { it.name == "IOS" } ?: return v
+        fun note(t: String) = v.copy(log = (v.log + "\nHLS: " + t).trim())
         return try {
-            val url = attempt(ios, videoId).video?.hlsUrl.orEmpty()
-            if (url.isEmpty()) return v
+            val a = attempt(ios, videoId)
+            val url = a.video?.hlsUrl.orEmpty()
+            if (url.isEmpty()) {
+                return note("IOS ne manifest nahi diya (${a.report.playability ?: a.report.error ?: "?"})")
+            }
             val text = downloader.getText(url, mapOf("User-Agent" to ios.userAgent))
-            if (text == null || !text.contains("#EXTM3U")) return v
+            if (text == null || !text.contains("#EXTM3U")) return note("manifest khula nahi")
             val maxH = Regex("RESOLUTION=\\d+x(\\d+)").findAll(text)
                 .mapNotNull { it.groupValues[1].toIntOrNull() }.maxOrNull() ?: 0
-            v.copy(hlsUrl = url, hlsUserAgent = ios.userAgent, hlsMaxHeight = maxH)
+            v.copy(
+                hlsUrl = url, hlsUserAgent = ios.userAgent, hlsMaxHeight = maxH,
+                log = (v.log + "\nHLS: ok ${maxH}p").trim()
+            )
         } catch (e: Exception) {
-            v
+            note("error ${e.message}")
         }
     }
 
@@ -343,8 +396,7 @@ class YoutubeExtractor(
         val url = (thumbs?.firstOrNull() as? Map<*, *>)?.get("url") as? String ?: return ""
         return if (url.startsWith("//")) "https:$url" else url
     }
-
-    // Agla page ka token (infinite scroll ke liye)
+      // Agla page ka token (infinite scroll ke liye)
     private fun findContinuationToken(node: Any?): String? {
         when (node) {
             is Map<*, *> -> {
@@ -421,7 +473,8 @@ class YoutubeExtractor(
                     contentLength = (f["contentLength"] as? String)?.toLongOrNull() ?: 0L,
                     codecs = codecRegex.find(mime)?.groupValues?.get(1)?.substringBefore(',')?.trim() ?: "",
                     client = c.name,
-                    userAgent = c.userAgent
+                    userAgent = c.userAgent,
+                    chunkSize = c.chunkSize
                 )
             )
         }
