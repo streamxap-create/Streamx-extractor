@@ -1,11 +1,15 @@
-name: Kotlin CI
+name: Build library JAR
 
 on:
   push:
     branches: [ "main" ]
+    tags: [ "v*", "V*" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -23,5 +27,17 @@ jobs:
     - name: Make gradlew executable
       run: chmod +x gradlew
 
-    - name: Build with Gradle
-      run: ./gradlew build
+    - name: Build, test and package
+      run: ./gradlew build fatJar --stacktrace
+
+    - name: Upload JARs
+      uses: actions/upload-artifact@v4
+      with:
+        name: streamx-extractor-jars
+        path: build/libs/*.jar
+
+    - name: Publish release (only for tags)
+      if: startsWith(github.ref, 'refs/tags/')
+      uses: softprops/action-gh-release@v2
+      with:
+        files: build/libs/*.jar
