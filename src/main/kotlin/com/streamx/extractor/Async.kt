@@ -19,3 +19,9 @@ suspend fun StreamxExtractor.suggestionsAsync(query: String): List<String> =
 
 suspend fun StreamxExtractor.findLyricsAsync(title: String, artist: String, durationSec: Int = 0): Lyrics? =
     withContext(Dispatchers.IO) { findLyrics(title, artist, durationSec) }
+
+suspend fun StreamxExtractor.getAudioAsync(videoId: String, useCache: Boolean = true): Video =
+    withContext(Dispatchers.IO) { getAudio(videoId, useCache) }
+
+suspend fun StreamxExtractor.findLyricsForVideoAsync(title: String, channelName: String, durationSec: Int = 0): Lyrics? =
+    withContext(Dispatchers.IO) { findLyricsForVideo(title, channelName, durationSec) }
