@@ -5,6 +5,7 @@ import com.squareup.moshi.kotlin.reflect.KotlinJsonAdapterFactory
 import com.streamx.extractor.ExtractorConfig
 import com.streamx.extractor.client.Downloader
 import com.streamx.extractor.model.ChannelInfo
+import com.streamx.extractor.model.PlaylistSummary
 import com.streamx.extractor.model.Comment
 import com.streamx.extractor.model.CommentPage
 import com.streamx.extractor.model.ItemPage
@@ -13,7 +14,13 @@ import com.streamx.extractor.model.MusicItem
 import com.streamx.extractor.model.MusicType
 import com.streamx.extractor.model.SearchFilter
 import com.streamx.extractor.model.Subtitle
-import java.util.stream.Collectors
+import com.streamx.extractor.model.audioLabel
+import java.util.concurrent.Callable
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ExecutorCompletionService
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import com.streamx.extractor.model.ClientReport
 import com.streamx.extractor.model.Stream
 import com.streamx.extractor.model.Thumbnail
@@ -24,6 +31,11 @@ import com.streamx.extractor.model.VideoItem
 class YoutubeExtractor(
     private val downloader: Downloader = Downloader()
 ) {
+
+    // Clients aur probes ek saath chalte hain (pehle ek ek karke chalte the = dheema)
+    private val pool: ExecutorService = Executors.newCachedThreadPool { r ->
+        Thread(r, "streamx-io").apply { isDaemon = true }
+    }
 
     private val moshi = Moshi.Builder()
         .add(KotlinJsonAdapterFactory())
@@ -116,7 +128,15 @@ class YoutubeExtractor(
         )
     )
 
-    // YouTube /player ke liye visitorData maangta hai (NewPipe/yt-dlp bhi bhejte hain). Ek baar le kar yaad rakhta hai.
+    // YouTube /player ke liye visitorData maangta hai (NewPipe/yt-dlp bhi bhejte hain).
+    // Same homepage fetch se ExtractorConfig.webClientVersion/musicClientVersion ko bhi
+    // LIVE kar deta hai — pehle ye dono ExtractorConfig mein ek fixed date (2025-01-01)
+    // par hardcoded the; YouTube kaafi purani clientVersion wali request par khali/invalid
+    // response de deta hai, jisse search/playlist/channel/related/radio sab "data scrape
+    // nahi hoti" lagta tha, jab ki player/getVideo() alag se kaam karta reh sakta tha
+    // (wo client-specific ANDROID/IOS/etc. version string use karta hai, is WEB version
+    // par depend nahi karta — isliye yahi ek jagah tooti dikhti thi). Ek hi fetch, result
+    // cache (by lazy) — baar baar homepage nahi mangwati.
     private val visitorData: String by lazy {
         try {
             val html = downloader.getText(
@@ -126,6 +146,18 @@ class YoutubeExtractor(
                     "Accept-Language" to "en-US,en;q=0.9"
                 )
             ) ?: ""
+            Regex("\"INNERTUBE_CONTEXT_CLIENT_VERSION\":\"([^\"]+)\"").find(html)?.groupValues?.get(1)
+                ?.let { cv ->
+                    ExtractorConfig.webClientVersion = cv
+                    // WEB_REMIX (music.youtube.com) ka version WEB jaisa hi date-stamp
+                    // share karta hai ("1.<date>.01.00" vs web ka "2.<date>.00.00") — isi
+                    // date se derive karne se music search bhi ek hi fetch se sync rehta
+                    // hai, alag se music.youtube.com fetch karne ki zaroorat nahi.
+                    val date = cv.substringAfter('.').substringBefore('.')
+                    if (date.length == 8 && date.all { it.isDigit() }) {
+                        ExtractorConfig.musicClientVersion = "1.$date.01.00"
+                    }
+                }
             Regex("\"visitorData\":\"([^\"]+)\"").find(html)?.groupValues?.get(1) ?: ""
         } catch (e: Exception) {
             ""
@@ -237,36 +269,42 @@ class YoutubeExtractor(
     }
 
     /**
-     * Har (height, codec) group ki sabse badi stream sach mein khol ke dekhta hai (parallel).
-     * 1440p / 2160p / 4320p bhi alag test hote hain; jo group 403 de wo hat jata hai, baaki qualities rehti hain.
+     * Har codec family (avc/vp9/av1) mein sabse ooncha height pehle test hota hai; jo pehla chal jaye
+     * uske neeche wale sab theek maane jate hain. Families, muxed aur audio saath saath test hote hain.
      */
     private fun verify(c: ClientConfig, v: Video): Verified {
         val h = mapOf("User-Agent" to c.userAgent)
 
-        val muxedTop = v.muxedStreams.maxByOrNull { it.height }
-        val muxedCode = muxedTop?.let { downloader.probe(it.url, h) }
+        val muxedTask = pool.submit(Callable<Int?> {
+            v.muxedStreams.maxByOrNull { it.height }?.let { downloader.probe(it.url, h) }
+        })
+        val audTask = pool.submit(Callable<Int?> {
+            v.pickAudio()?.let { deepProbe(it, h) }
+        })
 
-        val audTop = v.pickAudio()
-        val audCode = audTop?.let { deepProbe(it, h) }
-
-        val groups = v.videoOnlyStreams
-            .groupBy { Pair(it.height, codecFamily(it)) }
-            .values.toList()
-        val results = groups.parallelStream().map { g ->
-            val probe = g.maxByOrNull { it.bitrate } ?: g.first()
-            Pair(g, deepProbe(probe, h))
-        }.collect(Collectors.toList())
-
-        val okUrls = HashSet<String>()
-        var bestOkCode: Int? = null
-        var lastBad: Int? = null
-        for ((g, code) in results.sortedByDescending { it.first.first().height }) {
-            if (isOk(code)) {
-                g.forEach { okUrls.add(it.url) }
-                if (bestOkCode == null) bestOkCode = code
-            } else lastBad = code
+        val okUrls = ConcurrentHashMap.newKeySet<String>()
+        val okCodes = ConcurrentHashMap<String, Int>()
+        val badCodes = ConcurrentHashMap<String, Int>()
+        val famTasks = v.videoOnlyStreams.groupBy { codecFamily(it) }.map { (fam, list) ->
+            pool.submit(Runnable {
+                val byHeight = list.groupBy { it.height }.toSortedMap(compareByDescending<Int> { it })
+                for ((height, g) in byHeight) {
+                    val probe = g.maxByOrNull { it.bitrate } ?: g.first()
+                    val code = deepProbe(probe, h)
+                    if (isOk(code)) {
+                        list.filter { it.height <= height }.forEach { okUrls.add(it.url) }
+                        okCodes[fam] = code
+                        break
+                    } else {
+                        badCodes[fam] = code
+                    }
+                }
+            })
         }
-        val vidCode = bestOkCode ?: lastBad
+        famTasks.forEach { it.get() }
+        val muxedCode: Int? = muxedTask.get()
+        val audCode: Int? = audTask.get()
+        val vidCode: Int? = okCodes.values.firstOrNull() ?: badCodes.values.firstOrNull()
 
         val audioOk = isOk(audCode)
         val adaptiveOk = audioOk && okUrls.isNotEmpty()
@@ -298,34 +336,65 @@ class YoutubeExtractor(
         return "${c.name}: ${ver.video.bestHeight}p (mux ${ver.muxedProbe ?: "-"}, vid ${ver.videoProbe ?: "-"}, aud ${ver.audioProbe ?: "-"})"
     }
 
-    fun getVideo(videoId: String): Video {
-        val errors = mutableListOf<String>()
-        val log = mutableListOf<String>()
-        val good = mutableListOf<Video>()
+    private class Outcome(val index: Int, val line: String, val video: Video?)
 
-        for (c in clients) {
+    private fun runClient(index: Int, c: ClientConfig, videoId: String, audioOnly: Boolean): Outcome {
+        return try {
             val a = attempt(c, videoId)
             val v = a.video
-            if (v == null || v.streams.isEmpty()) {
-                log.add(logLine(c, a, null))
-                errors.add(log.last())
-                continue
+            if (v == null || v.streams.isEmpty()) return Outcome(index, logLine(c, a, null), null)
+            if (audioOnly) {
+                val au = v.pickAudio()
+                val code = au?.let { deepProbe(it, mapOf("User-Agent" to c.userAgent)) }
+                val line = "${c.name}: audio ${au?.let { audioLabel(it) } ?: "-"} (aud ${code ?: "-"})"
+                return if (isOk(code)) Outcome(index, line, v.copy(streams = v.audioStreams, log = line))
+                else Outcome(index, line, null)
             }
             val ver = verify(c, v)
-            log.add(logLine(c, a, ver))
-            if (ver.video.streams.isEmpty()) {
-                errors.add(log.last())
-                continue
-            }
-            val prevBest = good.maxOfOrNull { it.bestHeight } ?: 0
-            good.add(ver.video)
-            // 2 chalne wale clients mil gaye aur naye client se height nahi badhi to baaki ko tang na karo
-            // (agar badh rahi hai, jaise 1080 -> 4K, to agla client bhi try hota hai)
-            if (good.size >= 2 && ver.video.bestHeight >= 1080 && ver.video.bestHeight <= prevBest) break
+            val line = logLine(c, a, ver)
+            Outcome(index, line, if (ver.video.streams.isEmpty()) null else ver.video)
+        } catch (e: Exception) {
+            Outcome(index, "${c.name}: error ${e.message}", null)
         }
+    }
 
+    /**
+     * Saare clients ek saath. Jaise hi achi quality + 2 clients mil jayein (ya pehle ke baad thodi mohlat)
+     * baaki ka intezar nahi hota.
+     */
+    fun getVideo(videoId: String): Video {
+        val t0 = System.currentTimeMillis()
+        val ecs = ExecutorCompletionService<Outcome>(pool)
+        val futures = clients.mapIndexed { i, c -> ecs.submit(Callable { runClient(i, c, videoId, false) }) }
+        val results = mutableListOf<Outcome>()
+        var firstGoodAt = 0L
+        var pending = clients.size
+        try {
+            while (pending > 0) {
+                val now = System.currentTimeMillis()
+                var wait = t0 + 25_000 - now
+                if (firstGoodAt > 0) {
+                    val top = results.mapNotNull { it.video }.maxOfOrNull { it.bestHeight } ?: 0
+                    wait = minOf(wait, firstGoodAt + (if (top >= 1080) 2_000 else 5_000) - now)
+                }
+                if (wait <= 0) break
+                val f = ecs.poll(wait, TimeUnit.MILLISECONDS) ?: break
+                pending--
+                val o = try { f.get() } catch (e: Exception) { continue }
+                results.add(o)
+                if (o.video != null && firstGoodAt == 0L) firstGoodAt = System.currentTimeMillis()
+                val g = results.mapNotNull { it.video }
+                val top = g.maxOfOrNull { it.bestHeight } ?: 0
+                if (top >= 2160 || (g.size >= 2 && top >= 1080)) break
+            }
+        } finally {
+            futures.forEach { it.cancel(true) }
+        }
+        results.sortBy { it.index }
+        val good = results.mapNotNull { it.video }
+        val log = results.map { it.line }
         if (good.isEmpty()) {
-            throw Exception("Video load fail ($videoId) -> " + errors.joinToString(" | "))
+            throw Exception("Video load fail ($videoId) -> " + log.joinToString(" | "))
         }
 
         val best = good.maxByOrNull { it.bestHeight }!!
@@ -338,12 +407,39 @@ class YoutubeExtractor(
             .map { it.copy(alternates = emptyList(), log = "") }
         val merged = best.copy(
             streams = best.streams + extraMuxed,
-            log = log.joinToString("\n"),
+            log = (log + "total ${System.currentTimeMillis() - t0}ms").joinToString("\n"),
             subtitles = good.flatMap { it.subtitles }.distinctBy { it.languageCode + it.auto },
             alternates = alts
         )
         // HLS sirf tab dekho jab adaptive se 720p se kam mili
         return if (merged.bestHeight >= 720) merged else withHls(merged, videoId)
+    }
+
+    /**
+     * Music ke liye tez raasta: sirf audio verify hoti hai (video ke 20 probes nahi).
+     * Jo client pehle chalti audio de, wahi jeet jata hai.
+     */
+    fun getAudio(videoId: String): Video {
+        val ecs = ExecutorCompletionService<Outcome>(pool)
+        val futures = clients.mapIndexed { i, c -> ecs.submit(Callable { runClient(i, c, videoId, true) }) }
+        val lines = mutableListOf<String>()
+        val deadline = System.currentTimeMillis() + 20_000
+        var pending = clients.size
+        try {
+            while (pending > 0) {
+                val wait = deadline - System.currentTimeMillis()
+                if (wait <= 0) break
+                val f = ecs.poll(wait, TimeUnit.MILLISECONDS) ?: break
+                pending--
+                val o = try { f.get() } catch (e: Exception) { continue }
+                val v = o.video
+                if (v != null) return v
+                lines.add(o.line)
+            }
+        } finally {
+            futures.forEach { it.cancel(true) }
+        }
+        throw Exception("Audio load fail ($videoId) -> " + lines.joinToString(" | "))
     }
 
     // HLS manifest (bonus fallback) IOS client se aata hai. Manifest sach mein khulta hai ya nahi check karta hai.
@@ -380,12 +476,20 @@ class YoutubeExtractor(
 
     // ---------- Search / Home feed ----------
     private val webClientJson: Map<String, String>
-        get() = mapOf(
-            "clientName" to "WEB",
-            "clientVersion" to ExtractorConfig.webClientVersion,
-            "hl" to ExtractorConfig.hl,
-            "gl" to ExtractorConfig.gl
-        )
+        get() {
+            // Search/playlist/channel/related/radio never touched `visitorData` before
+            // (only getVideo()/getAudio() did), so the live-version fetch above never
+            // ran for them — they kept using ExtractorConfig's stale default forever.
+            // Just reading `visitorData` here forces that one-time fetch (and is free
+            // after the first call, since it's cached by `lazy`).
+            visitorData
+            return mapOf(
+                "clientName" to "WEB",
+                "clientVersion" to ExtractorConfig.webClientVersion,
+                "hl" to ExtractorConfig.hl,
+                "gl" to ExtractorConfig.gl
+            )
+        }
 
     fun search(query: String): List<VideoItem> = searchPage(query, null).items
 
@@ -410,26 +514,7 @@ class YoutubeExtractor(
         val response = downloader.postJson(url, payload, headers)
         val root = moshi.adapter(Map::class.java).fromJson(response) as Map<*, *>
 
-        val renderers = mutableListOf<Map<*, *>>()
-        collectVideoRenderers(root, renderers)
-
-        val seen = HashSet<String>()
-        val items = renderers.mapNotNull { r ->
-            val id = r["videoId"] as? String ?: return@mapNotNull null
-            if (!seen.add(id)) return@mapNotNull null
-            val owner = r["ownerText"] ?: r["longBylineText"]
-            VideoItem(
-                id = id,
-                title = textOf(r["title"]),
-                channelName = textOf(owner),
-                duration = textOf(r["lengthText"]),
-                views = textOf(r["viewCountText"]).ifEmpty { textOf(r["shortViewCountText"]) },
-                published = textOf(r["publishedTimeText"]),
-                thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
-                channelId = channelIdOf(owner),
-                channelThumbnail = avatarOf(r)
-            )
-        }
+        val items = itemsOf(root, "videoRenderer")
         return SearchPage(items, findContinuationToken(root))
     }
 
@@ -584,11 +669,74 @@ class YoutubeExtractor(
         )
     }
 
-    private fun itemsOf(root: Map<*, *>, rendererKey: String, fallbackChannel: String = ""): List<VideoItem> {
-        val rs = mutableListOf<Map<*, *>>()
-        collectRenderers(root, rendererKey, rs)
+    private fun collectMulti(node: Any?, keys: Set<String>, out: MutableList<Pair<String, Map<*, *>>>) {
+        when (node) {
+            is Map<*, *> -> {
+                for (k in keys) (node[k] as? Map<*, *>)?.let { out.add(k to it) }
+                node.values.forEach { collectMulti(it, keys, out) }
+            }
+            is List<*> -> node.forEach { collectMulti(it, keys, out) }
+        }
+    }
+
+    /**
+     * YouTube ab naye "lockupViewModel" format mein bhi videos deta hai (search, related, channel).
+     * Purana renderer aur naya lockup dono parse hote hain.
+     */
+    private fun lockupToItem(m: Map<*, *>, fallbackChannel: String): VideoItem? {
+        val type = m["contentType"] as? String
+        if (type != null && type != "LOCKUP_CONTENT_TYPE_VIDEO") return null
+        val id = m["contentId"] as? String ?: return null
+        if (id.length != 11) return null
+        val lm = (m["metadata"] as? Map<*, *>)?.get("lockupMetadataViewModel") as? Map<*, *> ?: return null
+        val title = (lm["title"] as? Map<*, *>)?.get("content") as? String ?: return null
+
+        val rows = ((lm["metadata"] as? Map<*, *>)?.get("contentMetadataViewModel") as? Map<*, *>)
+            ?.get("metadataRows") as? List<*> ?: emptyList<Any>()
+        val parts = mutableListOf<Pair<String, Any?>>()
+        for (row in rows) {
+            ((row as? Map<*, *>)?.get("metadataParts") as? List<*>)?.forEach { p ->
+                val txt = ((p as? Map<*, *>)?.get("text") as? Map<*, *>)?.get("content") as? String
+                if (txt != null) parts.add(txt to p)
+            }
+        }
+        val viewRe = Regex("view|watching", RegexOption.IGNORE_CASE)
+        val agoRe = Regex("\\bago\\b|streamed|premiere", RegexOption.IGNORE_CASE)
+        val views = parts.firstOrNull { viewRe.containsMatchIn(it.first) }?.first ?: ""
+        val published = parts.firstOrNull { agoRe.containsMatchIn(it.first) }?.first ?: ""
+        val channelPart = parts.firstOrNull { !viewRe.containsMatchIn(it.first) && !agoRe.containsMatchIn(it.first) }
+        val channelId = channelPart?.second?.let { findFirst(it, "browseId") as? String } ?: ""
+
+        val avatarSources = findFirst(lm["image"], "sources") as? List<*>
+        var avatar = (avatarSources?.firstOrNull() as? Map<*, *>)?.get("url") as? String ?: ""
+        if (avatar.startsWith("//")) avatar = "https:$avatar"
+        val duration = (findFirst(m["contentImage"], "thumbnailBadgeViewModel") as? Map<*, *>)?.get("text") as? String ?: ""
+
+        return VideoItem(
+            id = id,
+            title = title,
+            channelName = channelPart?.first ?: fallbackChannel,
+            duration = duration,
+            views = views,
+            published = published,
+            thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+            channelId = channelId,
+            channelThumbnail = if (channelPart != null) avatar else ""
+        )
+    }
+
+    private fun itemsOf(
+        root: Map<*, *>,
+        rendererKey: String,
+        fallbackChannel: String = "",
+        lockups: Boolean = true
+    ): List<VideoItem> {
+        val found = mutableListOf<Pair<String, Map<*, *>>>()
+        collectMulti(root, if (lockups) setOf(rendererKey, "lockupViewModel") else setOf(rendererKey), found)
         val seen = HashSet<String>()
-        return rs.mapNotNull { toItem(it, fallbackChannel) }.filter { seen.add(it.id) }
+        return found.mapNotNull { (k, r) ->
+            if (k == "lockupViewModel") lockupToItem(r, fallbackChannel) else toItem(r, fallbackChannel)
+        }.filter { seen.add(it.id) }
     }
 
     /** Playlist ke videos. Agla page: nextToken ko continuation mein do. */
@@ -599,7 +747,7 @@ class YoutubeExtractor(
         val root = postWeb("browse", body)
         val title = ((root["metadata"] as? Map<*, *>)?.get("playlistMetadataRenderer") as? Map<*, *>)
             ?.get("title") as? String ?: ""
-        return ItemPage(title, itemsOf(root, "playlistVideoRenderer"), findContinuationToken(root))
+        return ItemPage(title, itemsOf(root, "playlistVideoRenderer", lockups = false), findContinuationToken(root))
     }
 
     /** Channel ke videos (Videos tab). channelId "UC..." hona chahiye. */
@@ -617,6 +765,99 @@ class YoutubeExtractor(
     fun getRelated(videoId: String): List<VideoItem> {
         val root = postWeb("next", mapOf("videoId" to videoId))
         return itemsOf(root, "compactVideoRenderer")
+    }
+
+    // ---------- Comments ----------
+    // YouTube ne comments ka format badal diya hai: purana "commentRenderer" chhod kar ab
+    // "frameworkUpdates.entityBatchUpdate.mutations[].payload.commentEntityPayload" use
+    // karta hai. Fetch wahi /next endpoint hai jo getRelated() bhi use karta hai, bas
+    // continuation token "comments" section ke liye dhoondna padta hai (generic
+    // findContinuationToken() galat token utha sakta hai — related-videos "load more" bhi
+    // continuationItemRenderer hi hai — isliye yahan specifically top-level "results.results"
+    // ke andar comments-section ka hi token dhoondte hain).
+
+    /** Video ke comments ka pehla page (top comments). Agla page getCommentsPage(nextToken) se. */
+    fun getComments(videoId: String): CommentPage {
+        val root = postWeb("next", mapOf("videoId" to videoId))
+        val token = findCommentsEntryToken(root) ?: return CommentPage(emptyList(), null)
+        return getCommentsPage(token)
+    }
+
+    /** Agla comments page — getComments()/getCommentsPage() se mile nextToken se. */
+    fun getCommentsPage(continuationToken: String): CommentPage {
+        val root = postWeb("next", mapOf("continuation" to continuationToken))
+        return CommentPage(parseCommentsFromMutations(root), findNextCommentsContinuation(root))
+    }
+
+    private fun findCommentsEntryToken(root: Map<*, *>): String? {
+        val twoCol = (root["contents"] as? Map<*, *>)?.get("twoColumnWatchNextResults") as? Map<*, *>
+        val results = (twoCol?.get("results") as? Map<*, *>)?.get("results") as? Map<*, *>
+        val contents = results?.get("contents") as? List<*> ?: return null
+        for (item in contents) {
+            val sc = (item as? Map<*, *>)?.get("itemSectionRenderer")?.let { it as? Map<*, *> }
+                ?.get("contents") as? List<*> ?: continue
+            for (c in sc) {
+                val cir = (c as? Map<*, *>)?.get("continuationItemRenderer") as? Map<*, *> ?: continue
+                val token = ((cir["continuationEndpoint"] as? Map<*, *>)?.get("continuationCommand") as? Map<*, *>)
+                    ?.get("token") as? String
+                if (token != null) return token
+            }
+        }
+        return null
+    }
+
+    private fun findNextCommentsContinuation(root: Map<*, *>): String? {
+        val endpoints = root["onResponseReceivedEndpoints"] as? List<*> ?: return null
+        for (ep in endpoints) {
+            val e = ep as? Map<*, *> ?: continue
+            val items = (e["reloadContinuationItemsCommand"] as? Map<*, *>)?.get("continuationItems") as? List<*>
+                ?: (e["appendContinuationItemsAction"] as? Map<*, *>)?.get("continuationItems") as? List<*>
+                ?: continue
+            for (it in items) {
+                val cir = (it as? Map<*, *>)?.get("continuationItemRenderer") as? Map<*, *> ?: continue
+                val direct = ((cir["continuationEndpoint"] as? Map<*, *>)?.get("continuationCommand") as? Map<*, *>)
+                    ?.get("token") as? String
+                val viaButton = (((cir["button"] as? Map<*, *>)?.get("buttonRenderer") as? Map<*, *>)
+                    ?.get("command") as? Map<*, *>)?.get("continuationCommand")?.let { it as? Map<*, *> }
+                    ?.get("token") as? String
+                (direct ?: viaButton)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun parseCommentsFromMutations(root: Map<*, *>): List<Comment> {
+        val mutations = ((root["frameworkUpdates"] as? Map<*, *>)?.get("entityBatchUpdate") as? Map<*, *>)
+            ?.get("mutations") as? List<*> ?: return emptyList()
+        val out = mutableListOf<Comment>()
+        for (mu in mutations) {
+            val m = mu as? Map<*, *> ?: continue
+            val payload = (m["payload"] as? Map<*, *>)?.get("commentEntityPayload") as? Map<*, *> ?: continue
+            val props = payload["properties"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+            val toolbar = payload["toolbar"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+            val author = payload["author"] as? Map<*, *> ?: emptyMap<Any?, Any?>()
+            val commentId = (props["commentId"] as? String) ?: (m["entityKey"] as? String) ?: continue
+            val text = (props["content"] as? Map<*, *>)?.get("content") as? String ?: continue
+            if (text.isBlank()) continue
+            val heart = toolbar["heartState"] as? String
+            out.add(
+                Comment(
+                    commentId = commentId,
+                    author = props["authorButtonA11y"] as? String ?: author["displayName"] as? String ?: "",
+                    authorChannelId = author["channelId"] as? String ?: "",
+                    authorAvatarUrl = author["avatarThumbnailUrl"] as? String ?: "",
+                    text = text,
+                    likeCount = (toolbar["likeCountLiked"] as? String)
+                        ?: (toolbar["likeCountNotliked"] as? String) ?: "",
+                    publishedTime = props["publishedTime"] as? String ?: "",
+                    replyCount = (toolbar["replyCount"] as? String)?.toIntOrNull() ?: 0,
+                    isHearted = heart != null && heart != "TOOLBAR_HEART_STATE_UNHEARTED" && heart != "HEART_STATE_DEFAULT",
+                    isVerified = author["isVerified"] as? Boolean ?: false,
+                    isPinned = props["pinnedText"] != null
+                )
+            )
+        }
+        return out
     }
 
     // ---------- Subtitles ----------
@@ -658,8 +899,145 @@ class YoutubeExtractor(
     /** Is gaane jaisa "mix" (YouTube Radio). Pehla item wahi gaana hota hai; includeSeed=false se hat jata hai. */
     fun getRadio(videoId: String, includeSeed: Boolean = false): List<VideoItem> {
         val root = postWeb("next", mapOf("videoId" to videoId, "playlistId" to "RD$videoId"))
-        val items = itemsOf(root, "playlistPanelVideoRenderer")
+        val items = itemsOf(root, "playlistPanelVideoRenderer", lockups = false)
         return if (includeSeed) items else items.filter { it.id != videoId }
+    }
+
+    // ---------- StreamX app ke liye extra: channel resolve, shorts, playlist search, RSS feed ----------
+
+    /** "UC..." id, ya @handle / channel URL se channel id */
+    fun resolveChannelId(input: String): String {
+        Regex("UC[0-9A-Za-z_-]{22}").find(input)?.let { return it.value }
+        val url = if (input.startsWith("http")) input else "https://www.youtube.com/" + input.trimStart('/')
+        val root = postWeb("navigation/resolve_url", mapOf("url" to url))
+        val browse = (root["endpoint"] as? Map<*, *>)?.get("browseEndpoint") as? Map<*, *>
+        return browse?.get("browseId") as? String ?: ""
+    }
+
+    /** Channel ka Shorts tab */
+    fun getChannelShorts(channelId: String): List<VideoItem> {
+        val root = postWeb("browse", mapOf("browseId" to channelId, "params" to "EgZzaG9ydHPyBgUKA5oBAA=="))
+        val found = mutableListOf<Pair<String, Map<*, *>>>()
+        collectMulti(root, setOf("reelItemRenderer", "shortsLockupViewModel"), found)
+        val seen = HashSet<String>()
+        val out = ArrayList<VideoItem>()
+        for ((k, r) in found) {
+            var id: String? = null
+            var title = ""
+            var views = ""
+            if (k == "reelItemRenderer") {
+                id = r["videoId"] as? String
+                title = textOf(r["headline"])
+                views = textOf(r["viewCountText"])
+            } else {
+                val tap = (r["onTap"] as? Map<*, *>)?.get("innertubeCommand") as? Map<*, *>
+                id = (tap?.get("reelWatchEndpoint") as? Map<*, *>)?.get("videoId") as? String
+                val om = r["overlayMetadata"] as? Map<*, *>
+                title = (om?.get("primaryText") as? Map<*, *>)?.get("content") as? String ?: ""
+                views = (om?.get("secondaryText") as? Map<*, *>)?.get("content") as? String ?: ""
+            }
+            if (id == null || id.isEmpty() || !seen.add(id)) continue
+            out.add(
+                VideoItem(
+                    id = id, title = title, channelName = "", duration = "", views = views,
+                    published = "", thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg", isShort = true
+                )
+            )
+        }
+        return out
+    }
+
+    /** Playlists search */
+    fun searchPlaylists(query: String): List<PlaylistSummary> {
+        val root = postWeb("search", mapOf("query" to query, "params" to (SearchFilter.PLAYLISTS.params ?: "")))
+        val found = mutableListOf<Pair<String, Map<*, *>>>()
+        collectMulti(root, setOf("playlistRenderer", "lockupViewModel"), found)
+        val seen = HashSet<String>()
+        val out = ArrayList<PlaylistSummary>()
+        for ((k, r) in found) {
+            if (k == "playlistRenderer") {
+                val id = r["playlistId"] as? String ?: continue
+                if (!seen.add(id)) continue
+                val thumbs = ((r["thumbnails"] as? List<*>)?.firstOrNull() as? Map<*, *>)?.get("thumbnails") as? List<*>
+                var thumb = (thumbs?.lastOrNull() as? Map<*, *>)?.get("url") as? String ?: ""
+                if (thumb.startsWith("//")) thumb = "https:$thumb"
+                out.add(
+                    PlaylistSummary(
+                        id = id,
+                        title = textOf(r["title"]),
+                        thumbnailUrl = thumb,
+                        videoCount = (r["videoCount"] as? String)?.replace(",", "")?.toLongOrNull() ?: 0L,
+                        uploader = textOf(r["shortBylineText"]).ifEmpty { textOf(r["longBylineText"]) }
+                    )
+                )
+            } else {
+                if ((r["contentType"] as? String) != "LOCKUP_CONTENT_TYPE_PLAYLIST") continue
+                val id = r["contentId"] as? String ?: continue
+                if (!seen.add(id)) continue
+                val lm = (r["metadata"] as? Map<*, *>)?.get("lockupMetadataViewModel") as? Map<*, *>
+                val title = (lm?.get("title") as? Map<*, *>)?.get("content") as? String ?: ""
+                val badge = findFirst(r["contentImage"], "thumbnailBadgeViewModel") as? Map<*, *>
+                val count = (badge?.get("text") as? String)?.filter { it.isDigit() }?.toLongOrNull() ?: 0L
+                val srcs = findFirst(r["contentImage"], "sources") as? List<*>
+                var thumb = (srcs?.firstOrNull() as? Map<*, *>)?.get("url") as? String ?: ""
+                if (thumb.startsWith("//")) thumb = "https:$thumb"
+                val rows = ((lm?.get("metadata") as? Map<*, *>)?.get("contentMetadataViewModel") as? Map<*, *>)
+                    ?.get("metadataRows") as? List<*>
+                val firstPart = (((rows?.firstOrNull() as? Map<*, *>)?.get("metadataParts") as? List<*>)?.firstOrNull() as? Map<*, *>)
+                val uploader = (firstPart?.get("text") as? Map<*, *>)?.get("content") as? String ?: ""
+                out.add(PlaylistSummary(id = id, title = title, thumbnailUrl = thumb, videoCount = count, uploader = uploader))
+            }
+        }
+        return out
+    }
+
+    /** Search me channel dhoondh ke uska avatar (URL khali = nahi mila) */
+    fun searchChannelAvatar(query: String): String {
+        val root = postWeb("search", mapOf("query" to query, "params" to (SearchFilter.CHANNELS.params ?: "")))
+        val found = mutableListOf<Pair<String, Map<*, *>>>()
+        collectMulti(root, setOf("channelRenderer"), found)
+        val r = found.firstOrNull()?.second ?: return ""
+        val thumbs = (r["thumbnail"] as? Map<*, *>)?.get("thumbnails") as? List<*>
+        val url = (thumbs?.lastOrNull() as? Map<*, *>)?.get("url") as? String ?: return ""
+        return if (url.startsWith("//")) "https:$url" else url
+    }
+
+    /**
+     * Channel ke naye uploads (YouTube ka public RSS feed: ~15 sabse naye videos, asli date ke saath).
+     * Duration nahi milti. Shorts /shorts/ link se pehchane jate hain.
+     */
+    fun channelFeed(channelId: String): List<VideoItem> {
+        val xml = downloader.getText(
+            "https://www.youtube.com/feeds/videos.xml?channel_id=$channelId",
+            mapOf("User-Agent" to ExtractorConfig.webUserAgent)
+        ) ?: return emptyList()
+        fun tag(src: String, re: String): String =
+            Regex(re, RegexOption.DOT_MATCHES_ALL).find(src)?.groupValues?.get(1)?.trim() ?: ""
+        fun unesc(t: String): String = t.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">")
+            .replace("&quot;", "\"").replace("&#39;", "'")
+        val channelName = unesc(tag(xml, "<author>.*?<name>(.*?)</name>"))
+        val out = ArrayList<VideoItem>()
+        for (m in Regex("<entry>(.*?)</entry>", RegexOption.DOT_MATCHES_ALL).findAll(xml)) {
+            val e = m.groupValues[1]
+            val id = tag(e, "<yt:videoId>(.*?)</yt:videoId>")
+            if (id.isEmpty()) continue
+            out.add(
+                VideoItem(
+                    id = id,
+                    title = unesc(tag(e, "<title>(.*?)</title>")),
+                    channelName = channelName,
+                    duration = "",
+                    views = "",
+                    published = "",
+                    thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+                    channelId = channelId,
+                    publishedIso = tag(e, "<published>(.*?)</published>"),
+                    viewCount = tag(e, "<media:statistics views=\"(\\d+)\"").toLongOrNull() ?: -1L,
+                    isShort = e.contains("/shorts/")
+                )
+            )
+        }
+        return out
     }
 
     // ---------- Channel info ----------
@@ -691,62 +1069,9 @@ class YoutubeExtractor(
         )
     }
 
-    // ---------- Comments (experimental: YouTube ka format badalta rehta hai) ----------
-    private fun firstCommentsToken(videoId: String): String? {
-        val root = postWeb("next", mapOf("videoId" to videoId))
-        val sections = mutableListOf<Map<*, *>>()
-        collectRenderers(root, "itemSectionRenderer", sections)
-        val comments = sections.firstOrNull { it["sectionIdentifier"] == "comment-item-section" } ?: return null
-        return findContinuationToken(comments)
-    }
-
-    // Agle page ka token: sirf top-level list ke aakhri item se (replies ke tokens ignore)
-    private fun nextCommentsToken(root: Map<*, *>): String? {
-        val endpoints = root["onResponseReceivedEndpoints"] as? List<*> ?: return null
-        for (e in endpoints) {
-            val m = e as? Map<*, *> ?: continue
-            val cmd = (m["reloadContinuationItemsCommand"] ?: m["appendContinuationItemsAction"]) as? Map<*, *> ?: continue
-            val last = (cmd["continuationItems"] as? List<*>)?.lastOrNull() as? Map<*, *> ?: continue
-            val cir = last["continuationItemRenderer"] as? Map<*, *> ?: continue
-            val direct = ((cir["continuationEndpoint"] as? Map<*, *>)?.get("continuationCommand") as? Map<*, *>)
-                ?.get("token") as? String
-            if (direct != null) return direct
-            val viaButton = ((((cir["button"] as? Map<*, *>)?.get("buttonRenderer") as? Map<*, *>)
-                ?.get("command") as? Map<*, *>)?.get("continuationCommand") as? Map<*, *>)?.get("token") as? String
-            if (viaButton != null) return viaButton
-        }
-        return null
-    }
-
-    fun getComments(videoId: String, continuation: String? = null): CommentPage {
-        val token = continuation ?: firstCommentsToken(videoId) ?: return CommentPage(emptyList(), null)
-        val root = postWeb("next", mapOf("continuation" to token))
-        val mutations = ((root["frameworkUpdates"] as? Map<*, *>)?.get("entityBatchUpdate") as? Map<*, *>)
-            ?.get("mutations") as? List<*> ?: emptyList<Any>()
-        val out = mutableListOf<Comment>()
-        for (mu in mutations) {
-            val c = ((mu as? Map<*, *>)?.get("payload") as? Map<*, *>)?.get("commentEntityPayload") as? Map<*, *> ?: continue
-            val props = c["properties"] as? Map<*, *>
-            val author = c["author"] as? Map<*, *>
-            val toolbar = c["toolbar"] as? Map<*, *>
-            val text = (props?.get("content") as? Map<*, *>)?.get("content") as? String ?: continue
-            out.add(
-                Comment(
-                    id = props["commentId"] as? String ?: "",
-                    author = author?.get("displayName") as? String ?: "",
-                    text = text,
-                    likes = toolbar?.get("likeCountNotliked") as? String ?: "",
-                    published = props["publishedTime"] as? String ?: "",
-                    avatarUrl = author?.get("avatarThumbnailUrl") as? String ?: "",
-                    replyCount = toolbar?.get("replyCount") as? String ?: ""
-                )
-            )
-        }
-        return CommentPage(out, nextCommentsToken(root))
-    }
-
     // ---------- YouTube Music search (best-effort, layout badle to update chahiye) ----------
     private fun postMusic(endpoint: String, body: Map<String, Any>): Map<*, *> {
+        visitorData // same live-version fetch as webClientJson — see its comment above
         val client = mapOf(
             "clientName" to "WEB_REMIX",
             "clientVersion" to ExtractorConfig.musicClientVersion,

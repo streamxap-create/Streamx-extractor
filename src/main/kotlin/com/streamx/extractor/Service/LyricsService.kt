@@ -4,6 +4,7 @@ import com.squareup.moshi.Moshi
 import com.streamx.extractor.client.Downloader
 import com.streamx.extractor.model.LyricLine
 import com.streamx.extractor.model.Lyrics
+import com.streamx.extractor.model.cleanArtist
 import java.net.URLEncoder
 import kotlin.math.abs
 
@@ -38,6 +39,40 @@ object LrcParser {
             if (lines[mid].timeMs <= positionMs) { ans = mid; lo = mid + 1 } else hi = mid - 1
         }
         return ans
+    }
+}
+
+/**
+ * YouTube ke title + channel se gaane ka asli (title, artist) nikalta hai, taake LRCLIB par
+ * lyrics mil sakein. "Song (Official Video)" jaisa shor hata deta hai, "Artist - Title" todta hai.
+ */
+object LyricsQuery {
+    private val noise = Regex(
+        """\s*[\(\[][^\)\]]*(official|video|audio|lyric|visuali[sz]er|\bhd\b|\b4k\b|\bmv\b|m/v|full song|remaster|music)[^\)\]]*[\)\]]""",
+        RegexOption.IGNORE_CASE
+    )
+    private val vevo = Regex("""(?i)\s*(vevo|official)$""")
+
+    fun cleanTitle(t: String): String =
+        noise.replace(t, "").substringBefore(" | ").replace(Regex("\\s+"), " ").trim()
+
+    fun cleanChannel(c: String): String =
+        vevo.replace(cleanArtist(c), "").trim()
+
+    /** Koshish karne ke liye (title, artist) jodiyan, sabse mumkin pehle. Zyada se zyada 3. */
+    fun candidates(title: String, channelName: String): List<Pair<String, String>> {
+        val out = LinkedHashSet<Pair<String, String>>()
+        val clean = cleanTitle(title)
+        val isTopic = channelName.endsWith(" - Topic")
+        if (!isTopic && " - " in clean) {
+            val a = clean.substringBefore(" - ").trim()
+            val t = clean.substringAfter(" - ").trim()
+            if (a.isNotEmpty() && t.isNotEmpty()) out.add(t to a)
+        }
+        val channel = cleanChannel(channelName)
+        if (clean.isNotEmpty() && channel.isNotEmpty()) out.add(clean to channel)
+        if (title.isNotBlank() && channel.isNotEmpty()) out.add(title.trim() to channel)
+        return out.filter { it.first.isNotBlank() && it.second.isNotBlank() }.take(3)
     }
 }
 
@@ -79,5 +114,14 @@ class LyricsService(private val downloader: Downloader = Downloader()) {
             list.minByOrNull { abs(((it["duration"] as? Number)?.toInt() ?: 0) - durationSec) }
         } else list.firstOrNull { !(it["syncedLyrics"] as? String).isNullOrEmpty() } ?: list.first()
         return best?.let { toLyrics(it) }
+    }
+
+    /** YouTube video (title + channel) ke liye lyrics: kai (title, artist) combinations try karta hai. */
+    fun findForVideo(title: String, channelName: String, durationSec: Int = 0): Lyrics? {
+        for ((t, a) in LyricsQuery.candidates(title, channelName)) {
+            val hit = find(t, a, durationSec)
+            if (hit != null && (hit.synced.isNotEmpty() || hit.plain.isNotBlank() || hit.instrumental)) return hit
+        }
+        return null
     }
 }
