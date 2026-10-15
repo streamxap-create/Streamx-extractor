@@ -138,7 +138,10 @@ data class VideoItem(
     val published: String,    // "2 years ago"
     val thumbnailUrl: String,
     val channelId: String = "",
-    val channelThumbnail: String = ""   // channel ka logo
+    val channelThumbnail: String = "",  // channel ka logo
+    val publishedIso: String = "",      // channel feed (RSS) se: "2026-09-30T10:15:00+00:00"
+    val viewCount: Long = -1L,          // channel feed se asli number (baaki jagah -1)
+    val isShort: Boolean = false        // Shorts shelf / RSS /shorts/ link se
 )
 
 // Ek page: items + agla page lene ka token (null = aur nahi hai)
@@ -178,6 +181,25 @@ data class AudioOption(
     val codecs: String,
     val sampleRate: Int
 )
+
+// Video ka ek comment. YouTube ab comments "frameworkUpdates" ke through deta hai (purana
+// commentRenderer format chhod diya hai) — likeCount, publishedTime waghera wahi text hain
+// jo YouTube khud dikhata hai (e.g. "1.2K", "3 din pehle"), kisi number se calculate nahi kiye.
+data class Comment(
+    val commentId: String,
+    val author: String,
+    val authorChannelId: String = "",
+    val authorAvatarUrl: String = "",
+    val text: String,
+    val likeCount: String = "",
+    val publishedTime: String = "",
+    val replyCount: Int = 0,
+    val isHearted: Boolean = false,   // video-owner (creator) ne heart diya
+    val isVerified: Boolean = false,
+    val isPinned: Boolean = false
+)
+
+data class CommentPage(val items: List<Comment>, val nextToken: String?)
 
 fun audioLabel(s: Stream): String {
     val name = when {

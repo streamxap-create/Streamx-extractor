@@ -40,8 +40,24 @@ enum class SearchFilter(val params: String?) {
     VIDEOS("EgIQAQ=="),
     LIVE("EgJAAQ=="),
     UNDER_4_MIN("EgIYAQ=="),
-    NEWEST("CAISAhAB")
+    NEWEST("CAISAhAB"),
+    // upload date + sirf videos (relevance order)
+    TODAY("EgQIAhAB"),
+    THIS_WEEK("EgQIAxAB"),
+    THIS_MONTH("EgQIBBAB"),
+    THIS_YEAR("EgQIBRAB"),
+    PLAYLISTS("EgIQAw=="),
+    CHANNELS("EgIQAg==")
 }
+
+// Playlist card (search result)
+data class PlaylistSummary(
+    val id: String,
+    val title: String,
+    val thumbnailUrl: String,
+    val videoCount: Long = 0L,
+    val uploader: String = ""
+)
 
 data class LyricLine(val timeMs: Long, val text: String)
 
@@ -72,18 +88,6 @@ data class ChannelInfo(
     val subscribers: String = "",
     val keywords: String = ""
 )
-
-data class Comment(
-    val id: String,
-    val author: String,
-    val text: String,
-    val likes: String,
-    val published: String,
-    val avatarUrl: String = "",
-    val replyCount: String = ""
-)
-
-data class CommentPage(val comments: List<Comment>, val nextToken: String?)
 
 fun parseClock(s: String): Int {
     val parts = s.trim().split(":")
