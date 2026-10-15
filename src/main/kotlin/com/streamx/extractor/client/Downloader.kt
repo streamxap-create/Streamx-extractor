@@ -1,14 +1,20 @@
 package com.streamx.extractor.client
 
+import okhttp3.Dispatcher
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 
 class Downloader {
 
-    private val client = OkHttpClient.Builder()
+    private val client = (com.streamx.extractor.ExtractorConfig.httpClient ?: OkHttpClient.Builder().build()).newBuilder()
+        // OkHttp ek host par sirf 5 request ek saath chalata hai; probes ke liye zyada chahiye
+        .dispatcher(Dispatcher().apply { maxRequests = 64; maxRequestsPerHost = 16 })
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(15, TimeUnit.SECONDS)
         .addInterceptor { chain ->
             val original = chain.request()
             val builder = original.newBuilder()
@@ -21,6 +27,13 @@ class Downloader {
             builder.header("Accept-Language", "en-US,en;q=0.9")
             chain.proceed(builder.build())
         }
+        .build()
+
+    // Probes jaldi fail hone chahiye (slow/block client ka 10+ second intezar nahi)
+    private val probeClient = client.newBuilder()
+        .connectTimeout(4, TimeUnit.SECONDS)
+        .readTimeout(6, TimeUnit.SECONDS)
+        .callTimeout(8, TimeUnit.SECONDS)
         .build()
 
     private val JSON = "application/json".toMediaType()
@@ -55,7 +68,7 @@ class Downloader {
         val builder = Request.Builder().url(url).get().header("Range", "bytes=0-1")
         headers.forEach { (k, v) -> builder.header(k, v) }
         return try {
-            client.newCall(builder.build()).execute().use { it.code }
+            probeClient.newCall(builder.build()).execute().use { it.code }
         } catch (e: Exception) {
             -1
         }
@@ -85,7 +98,7 @@ class Downloader {
         val builder = Request.Builder().url(url).get().header("Range", "bytes=$start-$endInclusive")
         headers.forEach { (k, v) -> builder.header(k, v) }
         return try {
-            client.newCall(builder.build()).execute().use { r ->
+            probeClient.newCall(builder.build()).execute().use { r ->
                 if (r.code == 200 || r.code == 206) {
                     val buf = ByteArray(readBytes)
                     val n = r.body?.byteStream()?.read(buf) ?: -1
